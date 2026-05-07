@@ -35,10 +35,12 @@ warnings.filterwarnings("ignore")
 
 @dataclass
 class ArimaResult:
-    forecast: float       # precio esperado en el siguiente bar
+    forecast: float          # precio esperado en el siguiente bar
+    forecast_lower: float    # límite inferior del IC al 95 %
+    forecast_upper: float    # límite superior del IC al 95 %
     last_price: float
-    pct_change: float     # cambio relativo previsto
-    direction: int        # +1 alcista, -1 bajista, 0 neutro
+    pct_change: float        # cambio relativo previsto
+    direction: int           # +1 alcista, -1 bajista, 0 neutro
     success: bool
 
 
@@ -51,20 +53,29 @@ def arima_forecast(
 
     Trabajamos con los últimos ``lookback`` puntos para que el ajuste sea
     rápido y refleje la dinámica reciente (lo relevante para day-trading).
+    Además del punto central exponemos el intervalo de confianza al 95 %,
+    indispensable para fijar stops y targets con base estadística.
     """
     last_price = float(close.iloc[-1])
+    fail = ArimaResult(
+        last_price, last_price, last_price, last_price, 0.0, 0, success=False
+    )
 
     if len(close) < 50:
-        return ArimaResult(last_price, last_price, 0.0, 0, success=False)
+        return fail
 
     series = close.tail(lookback).astype(float)
 
     try:
         model = ARIMA(series, order=order)
         fit = model.fit()
-        forecast = float(fit.forecast(steps=1).iloc[0])
+        fc = fit.get_forecast(steps=1)
+        forecast = float(fc.predicted_mean.iloc[0])
+        ci = fc.conf_int(alpha=0.05)
+        lower = float(ci.iloc[0, 0])
+        upper = float(ci.iloc[0, 1])
     except Exception:
-        return ArimaResult(last_price, last_price, 0.0, 0, success=False)
+        return fail
 
     pct_change = (forecast - last_price) / last_price
     # Banda muerta del 0,05 % para no operar por ruido numérico
@@ -75,7 +86,15 @@ def arima_forecast(
     else:
         direction = 0
 
-    return ArimaResult(forecast, last_price, pct_change, direction, success=True)
+    return ArimaResult(
+        forecast=forecast,
+        forecast_lower=lower,
+        forecast_upper=upper,
+        last_price=last_price,
+        pct_change=pct_change,
+        direction=direction,
+        success=True,
+    )
 
 
 # ---------------------------------------------------------------------------

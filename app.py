@@ -20,6 +20,13 @@ from data import load_market_data
 from decision import WEIGHTS, build_signal
 from models import arima_forecast, garch_volatility, ml_direction
 from portfolio import estimate_win_loss, kelly_fraction, parametric_var
+from strategies import (
+    build_trade_plan,
+    intraday_sharpe,
+    momentum_score,
+    price_zscore,
+    project_daily,
+)
 
 
 st.set_page_config(
@@ -60,6 +67,20 @@ def analyze(ticker: str, interval: str, capital: float) -> Dict:
         kelly_fraction_value=kelly.fractional_kelly,
     )
 
+    plan = build_trade_plan(
+        ticker=ticker,
+        df=df,
+        arima=arima,
+        garch=garch,
+        ml=ml,
+        signal_action=signal.action,
+        position_dollars=signal.suggested_dollars,
+    )
+
+    sharpe = intraday_sharpe(df["LogReturn"])
+    z = price_zscore(df["Close"])
+    mom = momentum_score(df["Close"])
+
     return {
         "ticker": ticker,
         "interval": interval,
@@ -71,6 +92,10 @@ def analyze(ticker: str, interval: str, capital: float) -> Dict:
         "kelly": kelly,
         "var": var,
         "signal": signal,
+        "plan": plan,
+        "sharpe": sharpe,
+        "zscore": z,
+        "momentum": mom,
         "fetched_at": datetime.utcnow(),
     }
 
@@ -91,6 +116,13 @@ interval = st.sidebar.selectbox(
 )
 capital = st.sidebar.number_input(
     "Capital ficticio ($)", min_value=100.0, value=100_000.0, step=500.0
+)
+daily_target_pct = st.sidebar.slider(
+    "🎯 Objetivo de retorno diario (%)",
+    min_value=0.1, max_value=5.0, value=1.0, step=0.1,
+) / 100.0
+top_n = st.sidebar.number_input(
+    "Nº de Top Picks", min_value=1, max_value=10, value=3
 )
 
 if st.sidebar.button("🔄 Refrescar análisis"):
@@ -190,6 +222,123 @@ st.dataframe(
 
 
 # ---------------------------------------------------------------------------
+# Top Picks: recomendaciones explícitas para cubrir el objetivo diario
+# ---------------------------------------------------------------------------
+
+
+st.subheader(f"🚀 Top Picks Hoy — objetivo {daily_target_pct*100:.1f}% diario")
+
+all_plans = [r["plan"] for r in results.values() if "plan" in r]
+projection = project_daily(
+    plans=all_plans, capital=capital, target_pct=daily_target_pct, top_n=int(top_n),
+)
+
+p1, p2, p3, p4 = st.columns(4)
+p1.metric("Objetivo $", f"${projection.target_dollars:,.0f}",
+          delta=f"{daily_target_pct*100:.1f}% s/ capital")
+p2.metric("E[P&L] Top Picks", f"${projection.expected_dollars:,.0f}",
+          delta=f"{projection.coverage*100:.0f}% del objetivo")
+p3.metric("¿Cubre objetivo?",
+          "✅ SÍ" if projection.meets_target else "⚠️  NO",
+          delta=f"{len(projection.top_picks)} oportunidades")
+p4.metric("Capital comprometido",
+          f"${sum(p.position_dollars for p in projection.top_picks):,.0f}")
+
+if not projection.top_picks:
+    st.warning(
+        "⚠️  Ningún ticker cumple los filtros de calidad (BUY + EV positivo + R:R ≥ 1). "
+        "Hoy lo más rentable estadísticamente es **mantener efectivo** y esperar mejor "
+        "set-up. Forzar entradas destruye el ratio de ganancias del ranking."
+    )
+else:
+    if not projection.meets_target:
+        st.warning(
+            f"El P&L esperado de los Top Picks (${projection.expected_dollars:,.0f}) "
+            f"no alcanza el objetivo (${projection.target_dollars:,.0f}). "
+            "Considera ampliar la lista de tickers, bajar el objetivo, "
+            "o aceptar un día más conservador (NO sobre-apalancar)."
+        )
+
+    picks_df = pd.DataFrame(
+        [
+            {
+                "#": i + 1,
+                "Ticker": p.ticker,
+                "Estrategia": p.strategy,
+                "Régimen (Hurst)": f"{p.regime} ({p.hurst:.2f})",
+                "Acciones": p.shares,
+                "Entrada": p.entry,
+                "Stop": p.stop_loss,
+                "Target": p.take_profit,
+                "R:R": p.risk_reward,
+                "P(win)": p.prob_up,
+                "E[Ret %]": p.expected_return_pct,
+                "E[P&L $]": p.expected_pnl_dollars,
+                "Sharpe": p.sharpe_score,
+            }
+            for i, p in enumerate(projection.top_picks)
+        ]
+    ).set_index("#")
+
+    st.dataframe(
+        picks_df.style.format(
+            {
+                "Entrada": "${:,.2f}",
+                "Stop": "${:,.2f}",
+                "Target": "${:,.2f}",
+                "R:R": "{:.2f}",
+                "P(win)": "{:.1%}",
+                "E[Ret %]": "{:+.2%}",
+                "E[P&L $]": "${:+,.2f}",
+                "Sharpe": "{:.2f}",
+            }
+        ),
+        use_container_width=True,
+    )
+
+    # Tarjetas de orden ejecutable, una por pick
+    for i, p in enumerate(projection.top_picks, 1):
+        emoji = {"MOMENTUM_LONG": "📈", "MEAN_REVERSION_LONG": "↩️",
+                 "BREAKOUT_LONG": "💥"}.get(p.strategy, "🎯")
+        with st.expander(
+            f"{emoji}  #{i}  {p.ticker} — {p.strategy}  "
+            f"·  COMPRAR {p.shares} acc. @ ${p.entry:,.2f}  "
+            f"·  E[P&L] ${p.expected_pnl_dollars:+,.2f}",
+            expanded=(i == 1),
+        ):
+            c1, c2, c3 = st.columns(3)
+            c1.markdown(
+                f"""
+**Orden de COMPRA**
+- Ticker: **{p.ticker}**
+- Acciones: **{p.shares}**
+- Entrada (market): **${p.entry:,.2f}**
+- Capital comprometido: **${p.position_dollars:,.2f}**
+"""
+            )
+            c2.markdown(
+                f"""
+**Gestión de riesgo**
+- 🛑 Stop-loss: **${p.stop_loss:,.2f}**  ({(p.stop_loss/p.entry-1)*100:+.2f}%)
+- 🎯 Take-profit: **${p.take_profit:,.2f}**  ({(p.take_profit/p.entry-1)*100:+.2f}%)
+- R:R = **{p.risk_reward:.2f}** · Riesgo $ = **${p.risk_dollars:,.2f}**
+"""
+            )
+            c3.markdown(
+                f"""
+**Edge estadístico**
+- P(win) ML: **{p.prob_up:.1%}**
+- E[retorno]: **{p.expected_return_pct*100:+.2f}%**
+- E[P&L]: **${p.expected_pnl_dollars:+,.2f}**
+- Sharpe esperado: **{p.sharpe_score:.2f}**
+"""
+            )
+            st.markdown("**Razonamiento econométrico:**")
+            for note in p.rationale:
+                st.write(f"- {note}")
+
+
+# ---------------------------------------------------------------------------
 # Detalle por ticker
 # ---------------------------------------------------------------------------
 
@@ -209,6 +358,7 @@ garch = r["garch"]
 ml = r["ml"]
 kelly = r["kelly"]
 var = r["var"]
+plan = r["plan"]
 
 
 col1, col2, col3, col4 = st.columns(4)
@@ -228,6 +378,42 @@ col4.metric(
     f"-${var.var_money:,.0f}",
     delta=f"{var.var_pct:.2%}",
 )
+
+
+# ----- Plan de trade concreto -----
+if plan.strategy != "AVOID":
+    st.markdown(
+        f"### 📝 Plan de trade — **{plan.strategy}** "
+        f"(régimen {plan.regime}, Hurst {plan.hurst:.2f})"
+    )
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    pc1.metric("Comprar", f"{plan.shares} acc.",
+               delta=f"@ ${plan.entry:,.2f}")
+    pc2.metric("Stop-loss", f"${plan.stop_loss:,.2f}",
+               delta=f"{(plan.stop_loss/plan.entry-1)*100:+.2f}%")
+    pc3.metric("Take-profit", f"${plan.take_profit:,.2f}",
+               delta=f"{(plan.take_profit/plan.entry-1)*100:+.2f}%")
+    pc4.metric("R:R", f"{plan.risk_reward:.2f}",
+               delta=f"E[P&L] ${plan.expected_pnl_dollars:+,.0f}")
+    with st.expander("Detalle del plan"):
+        for n in plan.rationale:
+            st.write(f"- {n}")
+else:
+    st.info(
+        f"📝 Plan: **AVOID**. Señal actual = {plan.action}. "
+        "No se abre largo en este ticker."
+    )
+
+
+# ----- Econometría avanzada -----
+ec1, ec2, ec3, ec4 = st.columns(4)
+ec1.metric("Hurst", f"{plan.hurst:.2f}",
+           delta="trending" if plan.hurst > 0.55 else
+                 ("mean-rev" if plan.hurst < 0.45 else "neutro"))
+ec2.metric("Sharpe intradía (anual.)", f"{r['sharpe']:.2f}")
+ec3.metric("Z-score precio (20)", f"{r['zscore']:+.2f}",
+           delta="extremo" if abs(r['zscore']) > 2 else "normal")
+ec4.metric("Momentum (corto-medio)", f"{r['momentum']*100:+.2f}%")
 
 
 # Razonamiento
@@ -262,6 +448,9 @@ with m1:
     if arima.success:
         st.write(f"Precio previsto: `${arima.forecast:,.2f}`")
         st.write(f"Cambio esperado: `{arima.pct_change*100:+.3f}%`")
+        st.write(
+            f"IC 95 %: `[${arima.forecast_lower:,.2f}, ${arima.forecast_upper:,.2f}]`"
+        )
     else:
         st.write("No converge con los datos disponibles.")
 with m2:
@@ -335,7 +524,7 @@ fig.add_trace(
     row=1, col=1,
 )
 
-# Marcador para la previsión ARIMA
+# Marcador para la previsión ARIMA + IC al 95 %
 if arima.success:
     delta = tail.index[-1] - tail.index[-2]
     next_ts = tail.index[-1] + delta
@@ -348,6 +537,32 @@ if arima.success:
             line=dict(color="magenta", width=2, dash="dash"),
         ),
         row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[next_ts, next_ts],
+            y=[arima.forecast_lower, arima.forecast_upper],
+            name="ARIMA IC 95%",
+            mode="lines",
+            line=dict(color="magenta", width=8),
+            opacity=0.25,
+        ),
+        row=1, col=1,
+    )
+
+# Líneas de stop-loss y take-profit del plan vigente
+if plan.strategy != "AVOID":
+    fig.add_hline(
+        y=plan.entry, line_dash="dot", line_color="white",
+        annotation_text=f"Entrada {plan.entry:.2f}", row=1, col=1,
+    )
+    fig.add_hline(
+        y=plan.stop_loss, line_dash="dash", line_color="red",
+        annotation_text=f"Stop {plan.stop_loss:.2f}", row=1, col=1,
+    )
+    fig.add_hline(
+        y=plan.take_profit, line_dash="dash", line_color="lime",
+        annotation_text=f"Target {plan.take_profit:.2f}", row=1, col=1,
     )
 
 # RSI

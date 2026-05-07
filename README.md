@@ -10,8 +10,9 @@ tamaño de posición sobre el capital ficticio del simulador de Investopedia.
 | Archivo         | Responsabilidad |
 |-----------------|-----------------|
 | `data.py`       | Descarga (yfinance) e indicadores técnicos (RSI, MACD, Bollinger, SMA) |
-| `models.py`     | ARIMA(1,1,1), GARCH(1,1) y Gradient Boosting con `TimeSeriesSplit` |
+| `models.py`     | ARIMA(1,1,1) con IC 95 %, GARCH(1,1) y Gradient Boosting con `TimeSeriesSplit` |
 | `portfolio.py`  | VaR paramétrico al 95 % y Criterio de Kelly fraccional |
+| `strategies.py` | Hurst, ATR, Sharpe, planes ejecutables y proyección de P&L diario |
 | `decision.py`   | Pondera los modelos y emite la señal final + tamaño de posición |
 | `app.py`        | Dashboard de Streamlit con Plotly |
 | `requirements.txt` | Dependencias |
@@ -77,6 +78,48 @@ algo que en mercados nunca se cumple.
      datos recientes (la caché expira sola cada 5 minutos).
    - Revisa la **tabla resumen** (semáforo) y luego entra al **detalle**
      de un ticker para ver razonamiento, métricas econométricas y gráficos.
+
+## Estrategias concretas de compra
+
+Para maximizar el ratio de ganancias diario, el módulo `strategies.py`
+clasifica el régimen de cada ticker con el **exponente de Hurst** y aplica
+una de tres tácticas long-only. Para cada una se calcula entrada,
+stop-loss, take-profit y número de acciones a comprar:
+
+| Estrategia | Cuándo se activa | Stop | Take-Profit |
+|------------|------------------|------|-------------|
+| `MOMENTUM_LONG` | Hurst > 0.55 (tendencia persistente) | `entrada − 1.5·ATR` | `entrada + 2·R` |
+| `MEAN_REVERSION_LONG` | Hurst < 0.45 y precio en banda extrema (%B<0.2 ó >0.8) | `entrada − 1·ATR` | `min(BB media, 2·R)` |
+| `BREAKOUT_LONG` | Régimen mixto, ARIMA proyecta techo | `entrada − 1.5·ATR` | `máx(IC superior ARIMA, 2·R)` |
+
+Cada plan reporta:
+- **Acciones a comprar** (capital_kelly / precio).
+- **R:R** = recompensa / riesgo.
+- **P(win)** del modelo ML y **E[Retorno]** = `p·win% − (1−p)·loss%`.
+- **Sharpe esperado** del trade = `E[retorno] / σ_GARCH`.
+
+## Ranking cross-sectional y proyección diaria
+
+Los planes de todos los tickers se rankean por **Sharpe esperado** y se
+filtran los que tienen `EV ≤ 0` o `R:R < 1`. Las **Top-N** oportunidades
+se muestran como tarjetas con orden ejecutable lista para copiar al
+simulador.
+
+La barra lateral incluye un **objetivo de retorno diario** (% sobre
+capital). El motor proyecta la suma de E[P&L] de los Top Picks y avisa
+si **no cubre el objetivo** — en cuyo caso recomienda esperar mejor
+set-up en lugar de sobre-apalancar (filosofía Kelly: el camino más
+rápido a la quiebra es ignorar la varianza).
+
+## Econometría adicional disponible
+
+- **Exponente de Hurst** (escalado de varianza) — clasificador de régimen.
+- **ATR(14)** de Wilder — volatilidad absoluta para sizing de stops.
+- **Sharpe intradía anualizado** — calidad del retorno por unidad de riesgo.
+- **Z-score del precio** vs media de 20 — gatillo de mean-reversion.
+- **Momentum cross-term** (retorno corto − retorno medio) — confirmación.
+- **Intervalo de confianza al 95 % de ARIMA** — usado como techo de
+  beneficio en estrategias de breakout.
 
 ## Limitaciones conocidas
 
