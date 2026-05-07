@@ -20,6 +20,7 @@ from data import load_market_data
 from decision import WEIGHTS, build_signal
 from models import arima_forecast, garch_volatility, ml_direction
 from portfolio import estimate_win_loss, kelly_fraction, parametric_var
+from screener import select_finalists, stage1_screen
 from strategies import (
     build_trade_plan,
     intraday_sharpe,
@@ -27,6 +28,7 @@ from strategies import (
     price_zscore,
     project_daily,
 )
+from universe import combine_universes, list_universes
 
 
 st.set_page_config(
@@ -40,6 +42,13 @@ st.set_page_config(
 # Caché: el modelo se reentrena para cada (ticker, intervalo) pero sólo cada
 # 5 minutos para no saturar yfinance ni gastar CPU innecesariamente.
 # ---------------------------------------------------------------------------
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_stage1(tickers_key: str) -> pd.DataFrame:
+    """Cachea la etapa 1 del screener una hora — cambia poco entre sesiones."""
+    tickers = tickers_key.split(",") if tickers_key else []
+    return stage1_screen(tickers)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -101,18 +110,138 @@ def analyze(ticker: str, interval: str, capital: float) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Helper: render del bloque "Top Picks"
+# ---------------------------------------------------------------------------
+
+
+def render_top_picks(
+    plans, capital: float, daily_target_pct: float, top_n: int,
+    title_prefix: str = "🚀 Top Picks Hoy",
+):
+    projection = project_daily(plans, capital, daily_target_pct, int(top_n))
+    st.subheader(f"{title_prefix} — objetivo {daily_target_pct*100:.1f}% diario")
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Objetivo $", f"${projection.target_dollars:,.0f}",
+              delta=f"{daily_target_pct*100:.1f}% s/ capital")
+    p2.metric("E[P&L] Top Picks", f"${projection.expected_dollars:,.0f}",
+              delta=f"{projection.coverage*100:.0f}% del objetivo")
+    p3.metric("¿Cubre objetivo?",
+              "✅ SÍ" if projection.meets_target else "⚠️  NO",
+              delta=f"{len(projection.top_picks)} oportunidades")
+    p4.metric("Capital comprometido",
+              f"${sum(p.position_dollars for p in projection.top_picks):,.0f}")
+
+    if not projection.top_picks:
+        st.warning(
+            "⚠️  Ningún ticker cumple los filtros (BUY + EV positivo + R:R ≥ 1). "
+            "Lo más rentable estadísticamente hoy es **mantener efectivo** y "
+            "esperar mejor set-up. Forzar entradas destruye el ratio de ganancias."
+        )
+        return projection
+
+    if not projection.meets_target:
+        st.warning(
+            f"E[P&L] de los Top Picks = ${projection.expected_dollars:,.0f} no "
+            f"alcanza el objetivo (${projection.target_dollars:,.0f}). "
+            "Amplía la lista de tickers, baja el objetivo o acepta un día más "
+            "conservador (sobre-apalancar destruye varianza-ajustada)."
+        )
+
+    picks_df = pd.DataFrame(
+        [
+            {
+                "#": i + 1, "Ticker": p.ticker, "Estrategia": p.strategy,
+                "Régimen (Hurst)": f"{p.regime} ({p.hurst:.2f})",
+                "Acciones": p.shares, "Entrada": p.entry,
+                "Stop": p.stop_loss, "Target": p.take_profit,
+                "R:R": p.risk_reward, "P(win)": p.prob_up,
+                "E[Ret %]": p.expected_return_pct,
+                "E[P&L $]": p.expected_pnl_dollars,
+                "Sharpe": p.sharpe_score,
+            }
+            for i, p in enumerate(projection.top_picks)
+        ]
+    ).set_index("#")
+
+    st.dataframe(
+        picks_df.style.format(
+            {
+                "Entrada": "${:,.2f}", "Stop": "${:,.2f}", "Target": "${:,.2f}",
+                "R:R": "{:.2f}", "P(win)": "{:.1%}", "E[Ret %]": "{:+.2%}",
+                "E[P&L $]": "${:+,.2f}", "Sharpe": "{:.2f}",
+            }
+        ),
+        use_container_width=True,
+    )
+
+    for i, p in enumerate(projection.top_picks, 1):
+        emoji = {"MOMENTUM_LONG": "📈", "MEAN_REVERSION_LONG": "↩️",
+                 "BREAKOUT_LONG": "💥"}.get(p.strategy, "🎯")
+        with st.expander(
+            f"{emoji}  #{i}  {p.ticker} — {p.strategy}  "
+            f"·  COMPRAR {p.shares} acc. @ ${p.entry:,.2f}  "
+            f"·  E[P&L] ${p.expected_pnl_dollars:+,.2f}",
+            expanded=(i == 1),
+        ):
+            c1, c2, c3 = st.columns(3)
+            c1.markdown(
+                f"""
+**Orden de COMPRA**
+- Ticker: **{p.ticker}**
+- Acciones: **{p.shares}**
+- Entrada (market): **${p.entry:,.2f}**
+- Capital comprometido: **${p.position_dollars:,.2f}**
+"""
+            )
+            c2.markdown(
+                f"""
+**Gestión de riesgo**
+- 🛑 Stop-loss: **${p.stop_loss:,.2f}**  ({(p.stop_loss/p.entry-1)*100:+.2f}%)
+- 🎯 Take-profit: **${p.take_profit:,.2f}**  ({(p.take_profit/p.entry-1)*100:+.2f}%)
+- R:R = **{p.risk_reward:.2f}** · Riesgo $ = **${p.risk_dollars:,.2f}**
+"""
+            )
+            c3.markdown(
+                f"""
+**Edge estadístico**
+- P(win) ML: **{p.prob_up:.1%}**
+- E[retorno]: **{p.expected_return_pct*100:+.2f}%**
+- E[P&L]: **${p.expected_pnl_dollars:+,.2f}**
+- Sharpe esperado: **{p.sharpe_score:.2f}**
+"""
+            )
+            st.markdown("**Razonamiento econométrico:**")
+            for note in p.rationale:
+                st.write(f"- {note}")
+
+    return projection
+
+
+# ---------------------------------------------------------------------------
 # Sidebar: inputs del usuario
 # ---------------------------------------------------------------------------
 
 
 st.sidebar.title("⚙️  Configuración")
 
+mode = st.sidebar.radio(
+    "Modo",
+    ["📊 Mi watchlist", "🔭 Cazador en Yahoo"],
+    help=(
+        "Watchlist: analiza sólo los tickers que tú especifiques.\n"
+        "Cazador: barre cientos de acciones del S&P 500 / Nasdaq-100 / "
+        "Dow 30 con un screener de dos etapas y entrega los mejores "
+        "buys del día."
+    ),
+)
+
 default_tickers = "AAPL, TSLA, SPY, MSFT, NVDA"
 tickers_raw = st.sidebar.text_area(
     "Tickers (separados por coma)", value=default_tickers, height=80
 )
 interval = st.sidebar.selectbox(
-    "Intervalo", options=["1m", "5m", "15m", "30m", "1h", "1d"], index=1
+    "Intervalo intradía", options=["1m", "5m", "15m", "30m", "1h", "1d"], index=1
 )
 capital = st.sidebar.number_input(
     "Capital ficticio ($)", min_value=100.0, value=100_000.0, step=500.0
@@ -127,6 +256,7 @@ top_n = st.sidebar.number_input(
 
 if st.sidebar.button("🔄 Refrescar análisis"):
     analyze.clear()
+    cached_stage1.clear()
 
 tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
 
@@ -161,17 +291,151 @@ además *Half-Kelly* + cap del 25 % para evitar sobre-apalancarnos.
     )
 
 
-if not tickers:
-    st.warning("Introduce al menos un ticker en la barra lateral.")
+COLOR = {"BUY": "🟢", "HOLD": "🟡", "SELL": "🔴"}
+
+
+# ---------------------------------------------------------------------------
+# Modo "Cazador en Yahoo": screener de dos etapas
+# ---------------------------------------------------------------------------
+
+
+if mode == "🔭 Cazador en Yahoo":
+    st.subheader("🔭 Cazador de oportunidades — todo Yahoo Finance")
+    st.caption(
+        "Etapa 1: criba diaria de cientos de tickers por momentum, tendencia, "
+        "RSI y liquidez. Etapa 2: ARIMA + GARCH + ML + plan de trade sólo "
+        "sobre los finalistas. Salida: las mejores compras del día rankeadas "
+        "por Sharpe esperado."
+    )
+
+    col_l, col_r = st.columns([2, 1])
+    with col_l:
+        chosen_universes = st.multiselect(
+            "Universos a barrer",
+            list_universes(),
+            default=["S&P 500 large caps", "Nasdaq-100"],
+        )
+    with col_r:
+        n_finalists = st.number_input(
+            "Nº de finalistas (deep-analysis)",
+            min_value=5, max_value=30, value=12,
+            help="Más finalistas = más cobertura, pero cada uno requiere "
+                 "ajustar ARIMA/GARCH/ML (~5-15 s por ticker).",
+        )
+
+    extra_raw = st.text_input(
+        "Tickers extra (opcional, separados por coma)", value="",
+    )
+    extra_tickers = [t.strip().upper() for t in extra_raw.split(",") if t.strip()]
+
+    universe_tickers = combine_universes(chosen_universes, extra=extra_tickers)
+    st.caption(f"Universo total: **{len(universe_tickers)} tickers**")
+
+    if st.button("🚀 Lanzar búsqueda", type="primary"):
+        if not universe_tickers:
+            st.error("Selecciona al menos un universo o aporta tickers.")
+            st.stop()
+
+        with st.spinner(
+            f"Etapa 1 — cribando {len(universe_tickers)} tickers con datos diarios..."
+        ):
+            scored = cached_stage1(",".join(universe_tickers))
+
+        if scored.empty:
+            st.error(
+                "El screener no devolvió candidatos. Comprueba conexión a "
+                "Yahoo Finance o filtros de liquidez."
+            )
+            st.stop()
+
+        st.success(
+            f"Etapa 1 completada: {len(scored)} tickers viables "
+            f"(filtrado por liquidez y precio). Top 30 por score:"
+        )
+        st.dataframe(
+            scored.head(30).style.format(
+                {
+                    "price": "${:,.2f}",
+                    "ret_1d": "{:+.2%}", "ret_5d": "{:+.2%}", "ret_20d": "{:+.2%}",
+                    "vol_20d_ann": "{:.1%}",
+                    "avg_dollar_vol": "${:,.0f}",
+                    "rsi_14": "{:.1f}",
+                    "composite": "{:+.2f}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+        finalists = select_finalists(scored, int(n_finalists))
+        st.markdown(
+            f"### Etapa 2 — análisis profundo de {len(finalists)} finalistas"
+        )
+        st.write(", ".join(finalists))
+
+        progress = st.progress(0.0)
+        screener_results: Dict[str, Dict] = {}
+        for i, tk in enumerate(finalists, 1):
+            try:
+                screener_results[tk] = analyze(tk, interval, capital)
+            except Exception as exc:  # noqa: BLE001
+                screener_results[tk] = {"ticker": tk, "error": str(exc)}
+            progress.progress(i / len(finalists))
+        progress.empty()
+
+        # Tabla de finalistas con sus señales
+        sum_rows = []
+        for tk, r in screener_results.items():
+            if "error" in r:
+                continue
+            sig = r["signal"]
+            plan = r["plan"]
+            sum_rows.append(
+                {
+                    "Ticker": tk,
+                    "Precio": r["market"].last_price,
+                    "Señal": f"{COLOR[sig.action]} {sig.action}",
+                    "Score": sig.score,
+                    "Estrategia": plan.strategy,
+                    "E[P&L $]": plan.expected_pnl_dollars,
+                    "Sharpe": plan.sharpe_score,
+                }
+            )
+        if sum_rows:
+            st.dataframe(
+                pd.DataFrame(sum_rows).set_index("Ticker").style.format(
+                    {
+                        "Precio": "${:,.2f}", "Score": "{:+.2f}",
+                        "E[P&L $]": "${:+,.2f}", "Sharpe": "{:.2f}",
+                    }
+                ),
+                use_container_width=True,
+            )
+
+        # Top picks finales rankeados cross-section
+        plans = [r["plan"] for r in screener_results.values() if "plan" in r]
+        render_top_picks(
+            plans, capital, daily_target_pct, top_n,
+            title_prefix="🏆 Mejores compras del día",
+        )
+
+        st.caption(
+            "Recuerda: el screener filtra por momentum reciente y liquidez. "
+            "Las señales BUY siguen exigiendo EV positivo y R:R ≥ 1; si "
+            "ningún finalista pasa esos filtros, la recomendación correcta "
+            "es **no operar hoy**."
+        )
+
     st.stop()
 
 
 # ---------------------------------------------------------------------------
-# Tabla resumen (semáforo)
+# Modo "Watchlist": flujo clásico
 # ---------------------------------------------------------------------------
 
 
-COLOR = {"BUY": "🟢", "HOLD": "🟡", "SELL": "🔴"}
+if not tickers:
+    st.warning("Introduce al menos un ticker en la barra lateral.")
+    st.stop()
 
 summary_rows = []
 results: Dict[str, Dict] = {}
@@ -221,121 +485,8 @@ st.dataframe(
 )
 
 
-# ---------------------------------------------------------------------------
-# Top Picks: recomendaciones explícitas para cubrir el objetivo diario
-# ---------------------------------------------------------------------------
-
-
-st.subheader(f"🚀 Top Picks Hoy — objetivo {daily_target_pct*100:.1f}% diario")
-
 all_plans = [r["plan"] for r in results.values() if "plan" in r]
-projection = project_daily(
-    plans=all_plans, capital=capital, target_pct=daily_target_pct, top_n=int(top_n),
-)
-
-p1, p2, p3, p4 = st.columns(4)
-p1.metric("Objetivo $", f"${projection.target_dollars:,.0f}",
-          delta=f"{daily_target_pct*100:.1f}% s/ capital")
-p2.metric("E[P&L] Top Picks", f"${projection.expected_dollars:,.0f}",
-          delta=f"{projection.coverage*100:.0f}% del objetivo")
-p3.metric("¿Cubre objetivo?",
-          "✅ SÍ" if projection.meets_target else "⚠️  NO",
-          delta=f"{len(projection.top_picks)} oportunidades")
-p4.metric("Capital comprometido",
-          f"${sum(p.position_dollars for p in projection.top_picks):,.0f}")
-
-if not projection.top_picks:
-    st.warning(
-        "⚠️  Ningún ticker cumple los filtros de calidad (BUY + EV positivo + R:R ≥ 1). "
-        "Hoy lo más rentable estadísticamente es **mantener efectivo** y esperar mejor "
-        "set-up. Forzar entradas destruye el ratio de ganancias del ranking."
-    )
-else:
-    if not projection.meets_target:
-        st.warning(
-            f"El P&L esperado de los Top Picks (${projection.expected_dollars:,.0f}) "
-            f"no alcanza el objetivo (${projection.target_dollars:,.0f}). "
-            "Considera ampliar la lista de tickers, bajar el objetivo, "
-            "o aceptar un día más conservador (NO sobre-apalancar)."
-        )
-
-    picks_df = pd.DataFrame(
-        [
-            {
-                "#": i + 1,
-                "Ticker": p.ticker,
-                "Estrategia": p.strategy,
-                "Régimen (Hurst)": f"{p.regime} ({p.hurst:.2f})",
-                "Acciones": p.shares,
-                "Entrada": p.entry,
-                "Stop": p.stop_loss,
-                "Target": p.take_profit,
-                "R:R": p.risk_reward,
-                "P(win)": p.prob_up,
-                "E[Ret %]": p.expected_return_pct,
-                "E[P&L $]": p.expected_pnl_dollars,
-                "Sharpe": p.sharpe_score,
-            }
-            for i, p in enumerate(projection.top_picks)
-        ]
-    ).set_index("#")
-
-    st.dataframe(
-        picks_df.style.format(
-            {
-                "Entrada": "${:,.2f}",
-                "Stop": "${:,.2f}",
-                "Target": "${:,.2f}",
-                "R:R": "{:.2f}",
-                "P(win)": "{:.1%}",
-                "E[Ret %]": "{:+.2%}",
-                "E[P&L $]": "${:+,.2f}",
-                "Sharpe": "{:.2f}",
-            }
-        ),
-        use_container_width=True,
-    )
-
-    # Tarjetas de orden ejecutable, una por pick
-    for i, p in enumerate(projection.top_picks, 1):
-        emoji = {"MOMENTUM_LONG": "📈", "MEAN_REVERSION_LONG": "↩️",
-                 "BREAKOUT_LONG": "💥"}.get(p.strategy, "🎯")
-        with st.expander(
-            f"{emoji}  #{i}  {p.ticker} — {p.strategy}  "
-            f"·  COMPRAR {p.shares} acc. @ ${p.entry:,.2f}  "
-            f"·  E[P&L] ${p.expected_pnl_dollars:+,.2f}",
-            expanded=(i == 1),
-        ):
-            c1, c2, c3 = st.columns(3)
-            c1.markdown(
-                f"""
-**Orden de COMPRA**
-- Ticker: **{p.ticker}**
-- Acciones: **{p.shares}**
-- Entrada (market): **${p.entry:,.2f}**
-- Capital comprometido: **${p.position_dollars:,.2f}**
-"""
-            )
-            c2.markdown(
-                f"""
-**Gestión de riesgo**
-- 🛑 Stop-loss: **${p.stop_loss:,.2f}**  ({(p.stop_loss/p.entry-1)*100:+.2f}%)
-- 🎯 Take-profit: **${p.take_profit:,.2f}**  ({(p.take_profit/p.entry-1)*100:+.2f}%)
-- R:R = **{p.risk_reward:.2f}** · Riesgo $ = **${p.risk_dollars:,.2f}**
-"""
-            )
-            c3.markdown(
-                f"""
-**Edge estadístico**
-- P(win) ML: **{p.prob_up:.1%}**
-- E[retorno]: **{p.expected_return_pct*100:+.2f}%**
-- E[P&L]: **${p.expected_pnl_dollars:+,.2f}**
-- Sharpe esperado: **{p.sharpe_score:.2f}**
-"""
-            )
-            st.markdown("**Razonamiento econométrico:**")
-            for note in p.rationale:
-                st.write(f"- {note}")
+render_top_picks(all_plans, capital, daily_target_pct, top_n)
 
 
 # ---------------------------------------------------------------------------

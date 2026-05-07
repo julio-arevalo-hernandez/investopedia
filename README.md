@@ -13,6 +13,8 @@ tamaño de posición sobre el capital ficticio del simulador de Investopedia.
 | `models.py`     | ARIMA(1,1,1) con IC 95 %, GARCH(1,1) y Gradient Boosting con `TimeSeriesSplit` |
 | `portfolio.py`  | VaR paramétrico al 95 % y Criterio de Kelly fraccional |
 | `strategies.py` | Hurst, ATR, Sharpe, planes ejecutables y proyección de P&L diario |
+| `universe.py`   | Universos de búsqueda (S&P 500, Nasdaq-100, Dow 30, Mag 7, ETFs) |
+| `screener.py`   | Screener bursátil de dos etapas (cribado masivo + deep-analysis) |
 | `decision.py`   | Pondera los modelos y emite la señal final + tamaño de posición |
 | `app.py`        | Dashboard de Streamlit con Plotly |
 | `requirements.txt` | Dependencias |
@@ -78,6 +80,45 @@ algo que en mercados nunca se cumple.
      datos recientes (la caché expira sola cada 5 minutos).
    - Revisa la **tabla resumen** (semáforo) y luego entra al **detalle**
      de un ticker para ver razonamiento, métricas econométricas y gráficos.
+
+## Modo "Cazador en Yahoo" (screener de dos etapas)
+
+En el sidebar se elige el modo de operación:
+
+- **📊 Mi watchlist** — analiza únicamente los tickers que escribas.
+- **🔭 Cazador en Yahoo** — barre cientos de tickers de varios universos
+  (S&P 500 large caps, Nasdaq-100, Dow 30, Mag 7, ETFs sectoriales) y
+  devuelve las mejores compras del día.
+
+El Cazador hace dos pasadas para no quemar CPU:
+
+1. **Etapa 1 — cribado rápido (datos diarios, todo el universo).**
+   Bulk-download de 3 meses de cierres diarios y scoring compuesto con:
+
+   ```
+   composite =  0.40·z(retorno_5d)
+              + 0.20·z(retorno_20d)
+              + 0.20·trend(SMA20/SMA50)
+              + 0.10·rsi_score
+              − 0.10·z(|vol_20d − 30%|)
+   ```
+
+   Filtros duros: precio ≥ $5 y dollar-volume medio ≥ $5 M (descarta
+   ilíquidos donde el slippage destruye el edge). Resultado: ranking de
+   los ~110 tickers viables del S&P 500 + ~70 del Nasdaq-100.
+
+2. **Etapa 2 — análisis profundo (intradía, sólo finalistas).**
+   Sobre los Top-N (configurable, 12 por defecto) se ejecuta el pipeline
+   completo: ARIMA + GARCH + Gradient Boosting + clasificador de régimen
+   (Hurst) + plan de trade con stop-loss, take-profit, R:R y E[P&L].
+
+3. **Ranking cross-section por Sharpe esperado** y proyección contra el
+   objetivo diario. Si la suma de E[P&L] no cubre el objetivo, el panel
+   te lo dice — la decisión correcta es **no operar** ese día, no
+   sobre-apalancar para fingir que se cumple.
+
+Caché: la etapa 1 se cachea 1 hora (los datos diarios cambian poco),
+la etapa 2 cinco minutos. El botón "🔄 Refrescar análisis" invalida ambas.
 
 ## Estrategias concretas de compra
 
