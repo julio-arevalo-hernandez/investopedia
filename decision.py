@@ -102,12 +102,17 @@ def technical_score(latest: pd.Series) -> tuple[float, list]:
     return float(np.clip(np.mean(votes), -1.0, 1.0)), notes
 
 
-def _arima_score(arima: ArimaResult) -> float:
-    """Convierte el % esperado de ARIMA en una puntuación acotada."""
+def _arima_score(arima: ArimaResult, horizon_days: int = 1) -> float:
+    """Convierte el % esperado de ARIMA en una puntuación acotada.
+
+    El cap se escala con el horizonte: 1 % por día (saturado), de modo que
+    una previsión semanal del +5 % satura la puntuación, igual que una
+    previsión diaria del +1 %.
+    """
     if not arima.success:
         return 0.0
-    # Saturamos a ±1 % de cambio esperado por bar (intradía).
-    return float(np.clip(arima.pct_change / 0.01, -1.0, 1.0))
+    cap = 0.01 * max(1, horizon_days)
+    return float(np.clip(arima.pct_change / cap, -1.0, 1.0))
 
 
 def _ml_score(ml: MlResult) -> float:
@@ -154,6 +159,7 @@ def build_signal(
     ml: MlResult,
     capital: float,
     kelly_fraction_value: float,
+    horizon_days: int = 1,
 ) -> DecisionSignal:
     """Combina todo y devuelve la decisión final."""
     if df.empty:
@@ -164,7 +170,7 @@ def build_signal(
 
     latest = df.iloc[-1]
     tech, tech_notes = technical_score(latest)
-    arima_s = _arima_score(arima)
+    arima_s = _arima_score(arima, horizon_days=horizon_days)
     ml_s = _ml_score(ml)
 
     score = (

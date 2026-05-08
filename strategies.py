@@ -35,12 +35,59 @@ Las estrategias se rankean cross-sectionalmente por **Sharpe esperado**
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 
 from models import ArimaResult, GarchResult, MlResult
+
+
+# ---------------------------------------------------------------------------
+# Horizontes de inversión
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HorizonConfig:
+    """Configuración del horizonte temporal de la operativa.
+
+    Distintos horizontes implican distintos hiper-parámetros:
+
+    - ``days``        : días hábiles que la operación tiene para desarrollarse.
+    - ``interval``    : granularidad de datos sugerida para ese horizonte.
+    - ``atr_mult_stop`` : amplitud del stop en múltiplos de ATR (más amplio a
+      más horizonte para no salirnos por ruido intradía).
+    - ``r_multiple``  : R:R objetivo (más holgado a más horizonte porque el
+      mercado tiene tiempo de moverse).
+    - ``arima_steps`` : pasos hacia adelante que ARIMA proyecta y horizonte
+      del target del modelo de ML.
+    """
+    name: str
+    days: int
+    interval: str
+    atr_mult_stop: float
+    r_multiple: float
+    arima_steps: int
+
+
+HORIZONS: Dict[str, HorizonConfig] = {
+    "Diario":    HorizonConfig("Diario",    1,  "5m", 1.5, 2.0, 1),
+    "Semanal":   HorizonConfig("Semanal",   5,  "1h", 2.0, 3.0, 5),
+    "Quincenal": HorizonConfig("Quincenal", 10, "1d", 2.5, 3.0, 10),
+    "Mensual":   HorizonConfig("Mensual",   21, "1d", 3.0, 4.0, 21),
+}
+
+
+INTERVAL_BARS_PER_YEAR: Dict[str, int] = {
+    "1m": 252 * 390, "5m": 252 * 78, "15m": 252 * 26,
+    "30m": 252 * 13, "60m": 252 * 7, "1h": 252 * 7,
+    "1d": 252,
+}
+
+
+def bars_per_year(interval: str) -> int:
+    return INTERVAL_BARS_PER_YEAR.get(interval, 252 * 78)
 
 
 # ---------------------------------------------------------------------------
@@ -191,18 +238,24 @@ def build_trade_plan(
     ml: MlResult,
     signal_action: str,
     position_dollars: float,
-    atr_mult_stop: float = 1.5,
-    r_multiple: float = 2.0,
+    horizon: HorizonConfig | None = None,
+    atr_mult_stop: float | None = None,
+    r_multiple: float | None = None,
 ) -> TradePlan:
     """Construye un plan ejecutable para el ticker.
 
-    Parámetros de gestión:
-        * ``atr_mult_stop``  → distancia del stop en múltiplos de ATR.
-        * ``r_multiple``     → R:R objetivo (2.0 = target al doble del riesgo).
+    El plan se calibra con el ``HorizonConfig`` del horizonte temporal
+    seleccionado por el usuario. Si se pasan ``atr_mult_stop`` o
+    ``r_multiple`` explícitamente, sobreescriben los valores del horizonte.
 
     Si el motor no recomienda BUY, el plan se devuelve marcado como AVOID
     (cero acciones, cero exposición).
     """
+    h = horizon if horizon is not None else HORIZONS["Diario"]
+    if atr_mult_stop is None:
+        atr_mult_stop = h.atr_mult_stop
+    if r_multiple is None:
+        r_multiple = h.r_multiple
     close = df["Close"]
     latest = df.iloc[-1]
     entry = float(close.iloc[-1])
@@ -326,7 +379,9 @@ def rank_plans(plans: List[TradePlan]) -> List[TradePlan]:
 
 
 @dataclass
-class DailyProjection:
+class HorizonProjection:
+    horizon_name: str
+    horizon_days: int
     target_pct: float
     target_dollars: float
     expected_dollars: float
@@ -335,18 +390,30 @@ class DailyProjection:
     meets_target: bool
 
 
-def project_daily(
+def project_horizon(
     plans: List[TradePlan],
     capital: float,
     target_pct: float,
     top_n: int = 3,
-) -> DailyProjection:
-    """Selecciona las top-N oportunidades y proyecta su P&L vs. el objetivo."""
+    horizon: HorizonConfig | None = None,
+) -> HorizonProjection:
+    """Selecciona las top-N oportunidades y proyecta su P&L vs. el objetivo
+    a lo largo del horizonte temporal indicado.
+
+    No hay diferencia matemática entre horizonte diario y semanal aquí: la
+    suma de E[P&L] de los planes se compara con ``capital × target_pct``.
+    Lo que varía es que los planes (vía ``build_trade_plan``) están
+    calibrados para horizontes más largos: ARIMA proyecta varios pasos,
+    el ML predice retorno acumulado y los stops/targets son más amplios.
+    """
+    h = horizon if horizon is not None else HORIZONS["Diario"]
     ranked = rank_plans(plans)[:top_n]
     target_dollars = capital * target_pct
     expected = float(sum(p.expected_pnl_dollars for p in ranked))
     coverage = (expected / target_dollars) if target_dollars > 0 else 0.0
-    return DailyProjection(
+    return HorizonProjection(
+        horizon_name=h.name,
+        horizon_days=h.days,
         target_pct=target_pct,
         target_dollars=target_dollars,
         expected_dollars=expected,
@@ -354,3 +421,8 @@ def project_daily(
         top_picks=ranked,
         meets_target=coverage >= 1.0,
     )
+
+
+# Alias retro-compatible (firma equivalente al horizonte diario)
+DailyProjection = HorizonProjection
+project_daily = project_horizon

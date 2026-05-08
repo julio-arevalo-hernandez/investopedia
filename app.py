@@ -22,11 +22,13 @@ from models import arima_forecast, garch_volatility, ml_direction
 from portfolio import estimate_win_loss, kelly_fraction, parametric_var
 from screener import select_finalists, stage1_screen
 from strategies import (
+    HORIZONS,
+    bars_per_year,
     build_trade_plan,
     intraday_sharpe,
     momentum_score,
     price_zscore,
-    project_daily,
+    project_horizon,
 )
 from universe import combine_universes, list_universes
 
@@ -52,20 +54,25 @@ def cached_stage1(tickers_key: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def analyze(ticker: str, interval: str, capital: float) -> Dict:
+def analyze(ticker: str, interval: str, capital: float, horizon_name: str) -> Dict:
+    horizon = HORIZONS[horizon_name]
     market = load_market_data(ticker, interval=interval)
     df = market.prices
 
     if df.empty:
         return {"ticker": ticker, "interval": interval, "error": "Sin datos."}
 
-    arima = arima_forecast(df["Close"])
-    garch = garch_volatility(df["LogReturn"])
-    ml = ml_direction(df)
+    arima = arima_forecast(df["Close"], steps=horizon.arima_steps)
+    bpy = bars_per_year(interval)
+    garch = garch_volatility(df["LogReturn"], bars_per_year=bpy)
+    ml = ml_direction(df, steps=horizon.arima_steps)
 
     p, avg_w, avg_l = estimate_win_loss(df["LogReturn"])
     kelly = kelly_fraction(p, avg_w, avg_l)
-    var = parametric_var(df["LogReturn"], capital=capital, confidence=0.95)
+    var = parametric_var(
+        df["LogReturn"], capital=capital, confidence=0.95,
+        horizon_bars=horizon.arima_steps,
+    )
 
     signal = build_signal(
         df=df,
@@ -74,6 +81,7 @@ def analyze(ticker: str, interval: str, capital: float) -> Dict:
         ml=ml,
         capital=capital,
         kelly_fraction_value=kelly.fractional_kelly,
+        horizon_days=horizon.days,
     )
 
     plan = build_trade_plan(
@@ -84,9 +92,10 @@ def analyze(ticker: str, interval: str, capital: float) -> Dict:
         ml=ml,
         signal_action=signal.action,
         position_dollars=signal.suggested_dollars,
+        horizon=horizon,
     )
 
-    sharpe = intraday_sharpe(df["LogReturn"])
+    sharpe = intraday_sharpe(df["LogReturn"], bars_per_year=bpy)
     z = price_zscore(df["Close"])
     mom = momentum_score(df["Close"])
 
@@ -115,15 +124,21 @@ def analyze(ticker: str, interval: str, capital: float) -> Dict:
 
 
 def render_top_picks(
-    plans, capital: float, daily_target_pct: float, top_n: int,
-    title_prefix: str = "🚀 Top Picks Hoy",
+    plans, capital: float, target_pct: float, top_n: int,
+    horizon=None, title_prefix: str = "🚀 Top Picks",
 ):
-    projection = project_daily(plans, capital, daily_target_pct, int(top_n))
-    st.subheader(f"{title_prefix} — objetivo {daily_target_pct*100:.1f}% diario")
+    h = horizon if horizon is not None else HORIZONS["Diario"]
+    projection = project_horizon(
+        plans, capital, target_pct, int(top_n), horizon=h,
+    )
+    st.subheader(
+        f"{title_prefix} — objetivo {target_pct*100:.1f}% "
+        f"{h.name.lower()} ({h.days}d hábiles)"
+    )
 
     p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Objetivo $", f"${projection.target_dollars:,.0f}",
-              delta=f"{daily_target_pct*100:.1f}% s/ capital")
+    p1.metric(f"Objetivo {h.name}", f"${projection.target_dollars:,.0f}",
+              delta=f"{target_pct*100:.1f}% s/ capital")
     p2.metric("E[P&L] Top Picks", f"${projection.expected_dollars:,.0f}",
               delta=f"{projection.coverage*100:.0f}% del objetivo")
     p3.metric("¿Cubre objetivo?",
@@ -135,7 +150,7 @@ def render_top_picks(
     if not projection.top_picks:
         st.warning(
             "⚠️  Ningún ticker cumple los filtros (BUY + EV positivo + R:R ≥ 1). "
-            "Lo más rentable estadísticamente hoy es **mantener efectivo** y "
+            "Lo más rentable estadísticamente en este horizonte es **mantener efectivo** y "
             "esperar mejor set-up. Forzar entradas destruye el ratio de ganancias."
         )
         return projection
@@ -232,24 +247,56 @@ mode = st.sidebar.radio(
         "Watchlist: analiza sólo los tickers que tú especifiques.\n"
         "Cazador: barre cientos de acciones del S&P 500 / Nasdaq-100 / "
         "Dow 30 con un screener de dos etapas y entrega los mejores "
-        "buys del día."
+        "buys del horizonte."
     ),
 )
+
+horizon_name = st.sidebar.selectbox(
+    "⏱️  Horizonte de inversión",
+    options=list(HORIZONS.keys()),
+    index=0,
+    help=(
+        "Diario:    1 día  · target moderado, ARIMA 1-step, ATR×1.5 / R:R 2.0\n"
+        "Semanal:   5 días · target medio,    ARIMA 5-step, ATR×2.0 / R:R 3.0\n"
+        "Quincenal: 10 días · ARIMA 10-step, ATR×2.5 / R:R 3.0\n"
+        "Mensual:   21 días · ARIMA 21-step, ATR×3.0 / R:R 4.0"
+    ),
+)
+horizon = HORIZONS[horizon_name]
 
 default_tickers = "AAPL, TSLA, SPY, MSFT, NVDA"
 tickers_raw = st.sidebar.text_area(
     "Tickers (separados por coma)", value=default_tickers, height=80
 )
+
+intervals = ["1m", "5m", "15m", "30m", "1h", "1d"]
+default_interval_idx = (
+    intervals.index(horizon.interval) if horizon.interval in intervals else 1
+)
 interval = st.sidebar.selectbox(
-    "Intervalo intradía", options=["1m", "5m", "15m", "30m", "1h", "1d"], index=1
+    "Intervalo de datos",
+    options=intervals,
+    index=default_interval_idx,
+    help=f"Sugerido para {horizon.name}: {horizon.interval}",
+    key=f"interval_{horizon.name}",
 )
 capital = st.sidebar.number_input(
     "Capital ficticio ($)", min_value=100.0, value=100_000.0, step=500.0
 )
-daily_target_pct = st.sidebar.slider(
-    "🎯 Objetivo de retorno diario (%)",
-    min_value=0.1, max_value=5.0, value=1.0, step=0.1,
+
+# El objetivo crece sub-linealmente con el horizonte (raíz cuadrada del tiempo,
+# clásico en finanzas). Esto evita pedir 21 % al mensual (lo que forzaría
+# estrategias muy agresivas).
+default_target = float(np.sqrt(horizon.days) * 1.0)  # 1 % diario, ~2.2 % semanal
+max_target = float(max(5.0, horizon.days * 2.0))
+target_pct = st.sidebar.slider(
+    f"🎯 Objetivo de retorno {horizon.name.lower()} (%)",
+    min_value=0.1, max_value=max_target,
+    value=min(default_target, max_target), step=0.1,
+    key=f"target_{horizon.name}",
 ) / 100.0
+daily_target_pct = target_pct  # alias mantenido por código heredado
+
 top_n = st.sidebar.number_input(
     "Nº de Top Picks", min_value=1, max_value=10, value=3
 )
@@ -304,7 +351,7 @@ if mode == "🔭 Cazador en Yahoo":
     st.caption(
         "Etapa 1: criba diaria de cientos de tickers por momentum, tendencia, "
         "RSI y liquidez. Etapa 2: ARIMA + GARCH + ML + plan de trade sólo "
-        "sobre los finalistas. Salida: las mejores compras del día rankeadas "
+        "sobre los finalistas. Salida: las mejores compras del horizonte rankeadas "
         "por Sharpe esperado."
     )
 
@@ -376,7 +423,7 @@ if mode == "🔭 Cazador en Yahoo":
         screener_results: Dict[str, Dict] = {}
         for i, tk in enumerate(finalists, 1):
             try:
-                screener_results[tk] = analyze(tk, interval, capital)
+                screener_results[tk] = analyze(tk, interval, capital, horizon_name)
             except Exception as exc:  # noqa: BLE001
                 screener_results[tk] = {"ticker": tk, "error": str(exc)}
             progress.progress(i / len(finalists))
@@ -414,15 +461,16 @@ if mode == "🔭 Cazador en Yahoo":
         # Top picks finales rankeados cross-section
         plans = [r["plan"] for r in screener_results.values() if "plan" in r]
         render_top_picks(
-            plans, capital, daily_target_pct, top_n,
-            title_prefix="🏆 Mejores compras del día",
+            plans, capital, target_pct, top_n, horizon=horizon,
+            title_prefix=f"🏆 Mejores compras — horizonte {horizon.name.lower()}",
         )
 
         st.caption(
             "Recuerda: el screener filtra por momentum reciente y liquidez. "
             "Las señales BUY siguen exigiendo EV positivo y R:R ≥ 1; si "
             "ningún finalista pasa esos filtros, la recomendación correcta "
-            "es **no operar hoy**."
+            "es **no operar en este horizonte** (preservar capital es óptimo "
+            "cuando no hay edge)."
         )
 
     st.stop()
@@ -443,7 +491,7 @@ results: Dict[str, Dict] = {}
 with st.spinner("Descargando datos y entrenando modelos..."):
     for tk in tickers:
         try:
-            results[tk] = analyze(tk, interval, capital)
+            results[tk] = analyze(tk, interval, capital, horizon_name)
         except Exception as exc:  # noqa: BLE001
             results[tk] = {"ticker": tk, "error": str(exc)}
 
@@ -486,7 +534,7 @@ st.dataframe(
 
 
 all_plans = [r["plan"] for r in results.values() if "plan" in r]
-render_top_picks(all_plans, capital, daily_target_pct, top_n)
+render_top_picks(all_plans, capital, target_pct, top_n, horizon=horizon)
 
 
 # ---------------------------------------------------------------------------

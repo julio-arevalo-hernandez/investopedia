@@ -146,11 +146,33 @@ filtran los que tienen `EV ≤ 0` o `R:R < 1`. Las **Top-N** oportunidades
 se muestran como tarjetas con orden ejecutable lista para copiar al
 simulador.
 
-La barra lateral incluye un **objetivo de retorno diario** (% sobre
-capital). El motor proyecta la suma de E[P&L] de los Top Picks y avisa
-si **no cubre el objetivo** — en cuyo caso recomienda esperar mejor
-set-up en lugar de sobre-apalancar (filosofía Kelly: el camino más
-rápido a la quiebra es ignorar la varianza).
+La barra lateral incluye un **horizonte de inversión** (Diario, Semanal,
+Quincenal, Mensual) y un **objetivo de retorno** sobre ese horizonte.
+
+| Horizonte  | Días | Intervalo sugerido | ATR×stop | R:R | ARIMA steps |
+|------------|------|--------------------|----------|-----|-------------|
+| Diario     | 1    | 5m                 | 1.5      | 2.0 | 1           |
+| Semanal    | 5    | 1h                 | 2.0      | 3.0 | 5           |
+| Quincenal  | 10   | 1d                 | 2.5      | 3.0 | 10          |
+| Mensual    | 21   | 1d                 | 3.0      | 4.0 | 21          |
+
+Al cambiar de horizonte:
+- ARIMA proyecta `arima_steps` bars hacia adelante (no sólo el siguiente),
+  con su IC al 95 % ensanchado naturalmente por la raíz del tiempo.
+- El target del modelo de Machine Learning pasa a ser el signo del
+  **retorno acumulado** en los próximos `arima_steps` bars (más estable
+  y mejor calibrado para horizontes largos).
+- Los stops se amplían y los R:R objetivo crecen para no salir por ruido
+  intradía cuando el horizonte es semanal o más.
+- El umbral de saturación de la señal ARIMA escala con el horizonte
+  (1 % por día), así una previsión de +5 % a 5 días pesa lo mismo en
+  el score que una de +1 % a 1 día.
+
+El objetivo por defecto del slider escala con `√t` (clásico de finanzas):
+1 % diario, ~2.2 % semanal, ~3.2 % quincenal, ~4.6 % mensual. Si la suma
+del E[P&L] de los Top Picks no cubre el objetivo, el panel sugiere
+mantener efectivo en vez de sobre-apalancar (Kelly: el camino más rápido
+a la quiebra es ignorar la varianza).
 
 ## Econometría adicional disponible
 
