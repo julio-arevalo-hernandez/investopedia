@@ -17,7 +17,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from data import load_market_data
-from decision import WEIGHTS, build_signal
+from decision import SENSITIVITY_PRESETS, WEIGHTS, build_signal
 from models import arima_forecast, garch_volatility, ml_direction
 from portfolio import estimate_win_loss, kelly_fraction, parametric_var
 from screener import select_finalists, stage1_screen
@@ -54,7 +54,10 @@ def cached_stage1(tickers_key: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def analyze(ticker: str, interval: str, capital: float, horizon_name: str) -> Dict:
+def analyze(
+    ticker: str, interval: str, capital: float, horizon_name: str,
+    buy_threshold: float, risk_per_trade_pct: float,
+) -> Dict:
     horizon = HORIZONS[horizon_name]
     market = load_market_data(ticker, interval=interval)
     df = market.prices
@@ -82,6 +85,8 @@ def analyze(ticker: str, interval: str, capital: float, horizon_name: str) -> Di
         capital=capital,
         kelly_fraction_value=kelly.fractional_kelly,
         horizon_days=horizon.days,
+        buy_threshold=buy_threshold,
+        risk_per_trade_pct=risk_per_trade_pct,
     )
 
     plan = build_trade_plan(
@@ -93,6 +98,8 @@ def analyze(ticker: str, interval: str, capital: float, horizon_name: str) -> Di
         signal_action=signal.action,
         position_dollars=signal.suggested_dollars,
         horizon=horizon,
+        capital=capital,
+        risk_per_trade_pct=risk_per_trade_pct,
     )
 
     sharpe = intraday_sharpe(df["LogReturn"], bars_per_year=bpy)
@@ -284,6 +291,29 @@ capital = st.sidebar.number_input(
     "Capital ficticio ($)", min_value=100.0, value=100_000.0, step=500.0
 )
 
+sensitivity = st.sidebar.selectbox(
+    "🎚️  Sensibilidad de la señal",
+    options=list(SENSITIVITY_PRESETS.keys()),
+    index=1,  # Equilibrado por defecto
+    help=(
+        "Conservador (umbral 0.30): sólo BUY con consenso muy fuerte.\n"
+        "Equilibrado (0.15): recomendaciones moderadas (DEFAULT).\n"
+        "Agresivo (0.05): cualquier sesgo positivo cuenta — más operaciones, "
+        "menos convicción por operación."
+    ),
+)
+buy_threshold = SENSITIVITY_PRESETS[sensitivity]
+
+risk_per_trade_pct = st.sidebar.slider(
+    "⚠️  Riesgo por operación (% del capital)",
+    min_value=0.5, max_value=5.0, value=2.0, step=0.25,
+    help=(
+        "Cuánto capital pones en juego por trade (la pérdida si toca stop). "
+        "1-2 % es lo industria-standard; superior eleva el P&L pero también "
+        "el drawdown."
+    ),
+) / 100.0
+
 # El objetivo crece sub-linealmente con el horizonte (raíz cuadrada del tiempo,
 # clásico en finanzas). Esto evita pedir 21 % al mensual (lo que forzaría
 # estrategias muy agresivas).
@@ -423,7 +453,10 @@ if mode == "🔭 Cazador en Yahoo":
         screener_results: Dict[str, Dict] = {}
         for i, tk in enumerate(finalists, 1):
             try:
-                screener_results[tk] = analyze(tk, interval, capital, horizon_name)
+                screener_results[tk] = analyze(
+                    tk, interval, capital, horizon_name,
+                    buy_threshold, risk_per_trade_pct,
+                )
             except Exception as exc:  # noqa: BLE001
                 screener_results[tk] = {"ticker": tk, "error": str(exc)}
             progress.progress(i / len(finalists))
@@ -491,7 +524,10 @@ results: Dict[str, Dict] = {}
 with st.spinner("Descargando datos y entrenando modelos..."):
     for tk in tickers:
         try:
-            results[tk] = analyze(tk, interval, capital, horizon_name)
+            results[tk] = analyze(
+                tk, interval, capital, horizon_name,
+                buy_threshold, risk_per_trade_pct,
+            )
         except Exception as exc:  # noqa: BLE001
             results[tk] = {"ticker": tk, "error": str(exc)}
 
@@ -531,6 +567,54 @@ st.dataframe(
     ),
     use_container_width=True,
 )
+
+
+# ---------------------------------------------------------------------------
+# Panel de diagnóstico: por qué cada ticker no entra a Top Picks
+# ---------------------------------------------------------------------------
+
+
+with st.expander(
+    f"🔬  Diagnóstico — umbral activo {buy_threshold:+.2f} ({sensitivity})",
+    expanded=False,
+):
+    diag_rows = []
+    for tk, r in results.items():
+        if "error" in r:
+            continue
+        sig = r["signal"]
+        plan = r.get("plan")
+        diag_rows.append(
+            {
+                "Ticker": tk,
+                "Señal": f"{COLOR[sig.action]} {sig.action}",
+                "Score": sig.score,
+                "ML": sig.components.get("ml", 0.0),
+                "ARIMA": sig.components.get("arima", 0.0),
+                "Técnico": sig.components.get("technical", 0.0),
+                "Shares": plan.shares if plan else 0,
+                "E[P&L $]": plan.expected_pnl_dollars if plan else 0.0,
+                "R:R": plan.risk_reward if plan else 0.0,
+                "¿Por qué no BUY?": sig.block_reason or "—",
+            }
+        )
+    if diag_rows:
+        st.dataframe(
+            pd.DataFrame(diag_rows).set_index("Ticker").style.format(
+                {
+                    "Score": "{:+.2f}", "ML": "{:+.2f}", "ARIMA": "{:+.2f}",
+                    "Técnico": "{:+.2f}", "E[P&L $]": "${:+,.2f}", "R:R": "{:.2f}",
+                }
+            ),
+            use_container_width=True,
+        )
+        st.caption(
+            "**ML / ARIMA / Técnico** son los aportes ya ponderados (peso × valor). "
+            "Suman al **Score**. Si el score no llega al umbral, la fila explica "
+            "qué componente está más débil. Baja la sensibilidad a *Agresivo* "
+            "para operar con scores menores, o cambia el horizonte (semanal/mensual "
+            "tienden a generar scores más altos al integrar más estructura)."
+        )
 
 
 all_plans = [r["plan"] for r in results.values() if "plan" in r]

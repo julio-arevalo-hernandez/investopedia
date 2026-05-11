@@ -241,15 +241,19 @@ def build_trade_plan(
     horizon: HorizonConfig | None = None,
     atr_mult_stop: float | None = None,
     r_multiple: float | None = None,
+    capital: float | None = None,
+    risk_per_trade_pct: float = 0.02,
+    max_position_pct: float = 0.25,
 ) -> TradePlan:
     """Construye un plan ejecutable para el ticker.
 
     El plan se calibra con el ``HorizonConfig`` del horizonte temporal
-    seleccionado por el usuario. Si se pasan ``atr_mult_stop`` o
-    ``r_multiple`` explícitamente, sobreescriben los valores del horizonte.
-
-    Si el motor no recomienda BUY, el plan se devuelve marcado como AVOID
-    (cero acciones, cero exposición).
+    seleccionado. ``position_dollars`` es la sugerencia inicial del motor
+    de decisión, pero si está infradimensionada respecto a ``capital ×
+    risk_per_trade_pct / loss_pct`` (sizing estándar por riesgo fijo),
+    se eleva al mínimo industria-standard. Esto evita el bug histórico
+    donde Kelly sobre series intradía colapsaba a 0 y bloqueaba todas
+    las recomendaciones.
     """
     h = horizon if horizon is not None else HORIZONS["Diario"]
     if atr_mult_stop is None:
@@ -324,9 +328,28 @@ def build_trade_plan(
     stop_loss = min(stop_loss, entry * 0.999)
     take_profit = max(take_profit, entry * 1.001)
 
-    shares = int(position_dollars // entry) if entry > 0 else 0
+    # ----- Sizing: máximo entre la sugerencia del signal y el fixed-fractional -----
+    # Riesgo fijo por trade = ``capital × risk_per_trade_pct``.
+    # Shares por riesgo  = riesgo_$ / (entry − stop).
+    # Tomamos el MÁXIMO entre eso y la sugerencia (kelly+haircut) para garantizar
+    # que el motor SIEMPRE genere al menos una posición coherente cuando hay BUY.
+    loss_per_share = max(entry - stop_loss, entry * 0.005)
+    if capital is not None and capital > 0:
+        risk_budget = capital * risk_per_trade_pct
+        shares_by_risk = int(risk_budget // loss_per_share)
+    else:
+        shares_by_risk = 0
+    shares_by_kelly = int(position_dollars // entry) if entry > 0 else 0
+    shares = max(shares_by_risk, shares_by_kelly, 1 if signal_action == "BUY" else 0)
+
+    # Cap por trade: nunca más del max_position_pct del capital en un solo nombre.
+    if capital is not None and capital > 0 and entry > 0:
+        max_shares_by_size = int((capital * max_position_pct) // entry)
+        if max_shares_by_size > 0:
+            shares = min(shares, max_shares_by_size)
+
     actual_position = shares * entry
-    risk_dollars = shares * (entry - stop_loss)
+    risk_dollars = shares * loss_per_share
     reward_dollars = shares * (take_profit - entry)
     rr = (reward_dollars / risk_dollars) if risk_dollars > 0 else 0.0
 
@@ -365,15 +388,20 @@ def build_trade_plan(
 # ---------------------------------------------------------------------------
 
 
-def rank_plans(plans: List[TradePlan]) -> List[TradePlan]:
+def rank_plans(plans: List[TradePlan], min_rr: float = 0.8) -> List[TradePlan]:
     """Ordena los planes por Sharpe esperado descendente.
 
-    Filtra los AVOID y los planes con esperanza matemática negativa,
-    porque insistir en ellos sería capital quemado.
+    Filtra los AVOID y los planes claramente perdedores (EV ≤ 0 o R:R
+    muy bajo). El umbral mínimo de R:R se baja a 0.8 para no descartar
+    los mean-reversion en los que el target a la media móvil queda algo
+    cerca del entry — son operaciones de alta P(win), tolerables aunque
+    R:R baje algo de 1.
     """
     actionable = [
         p for p in plans
-        if p.strategy != "AVOID" and p.expected_pnl_dollars > 0 and p.risk_reward >= 1.0
+        if p.strategy != "AVOID"
+        and p.expected_pnl_dollars > 0
+        and p.risk_reward >= min_rr
     ]
     return sorted(actionable, key=lambda p: p.sharpe_score, reverse=True)
 
