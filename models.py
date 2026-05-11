@@ -35,10 +35,12 @@ warnings.filterwarnings("ignore")
 
 @dataclass
 class ArimaResult:
-    forecast: float       # precio esperado en el siguiente bar
+    forecast: float          # precio esperado en el siguiente bar
+    forecast_lower: float    # límite inferior del IC al 95 %
+    forecast_upper: float    # límite superior del IC al 95 %
     last_price: float
-    pct_change: float     # cambio relativo previsto
-    direction: int        # +1 alcista, -1 bajista, 0 neutro
+    pct_change: float        # cambio relativo previsto
+    direction: int           # +1 alcista, -1 bajista, 0 neutro
     success: bool
 
 
@@ -46,36 +48,57 @@ def arima_forecast(
     close: pd.Series,
     order: tuple = (1, 1, 1),
     lookback: int = 400,
+    steps: int = 1,
 ) -> ArimaResult:
-    """Ajusta un ARIMA simple y devuelve la previsión del siguiente bar.
+    """Ajusta un ARIMA simple y devuelve la previsión a ``steps`` bars vista.
 
     Trabajamos con los últimos ``lookback`` puntos para que el ajuste sea
-    rápido y refleje la dinámica reciente (lo relevante para day-trading).
+    rápido y refleje la dinámica reciente. Cuando ``steps > 1`` el resultado
+    representa el precio esperado al final del horizonte (no del siguiente
+    bar) y los IC se ensanchan acorde — ideal para horizontes semanal o
+    quincenal.
     """
     last_price = float(close.iloc[-1])
+    fail = ArimaResult(
+        last_price, last_price, last_price, last_price, 0.0, 0, success=False
+    )
 
     if len(close) < 50:
-        return ArimaResult(last_price, last_price, 0.0, 0, success=False)
+        return fail
 
     series = close.tail(lookback).astype(float)
 
     try:
         model = ARIMA(series, order=order)
         fit = model.fit()
-        forecast = float(fit.forecast(steps=1).iloc[0])
+        fc = fit.get_forecast(steps=int(max(1, steps)))
+        # Punto final del horizonte
+        forecast = float(fc.predicted_mean.iloc[-1])
+        ci = fc.conf_int(alpha=0.05)
+        lower = float(ci.iloc[-1, 0])
+        upper = float(ci.iloc[-1, 1])
     except Exception:
-        return ArimaResult(last_price, last_price, 0.0, 0, success=False)
+        return fail
 
     pct_change = (forecast - last_price) / last_price
-    # Banda muerta del 0,05 % para no operar por ruido numérico
-    if pct_change > 0.0005:
+    # Banda muerta proporcional al horizonte (ruido numérico crece con sqrt(t))
+    dead_band = 0.0005 * np.sqrt(max(1, steps))
+    if pct_change > dead_band:
         direction = 1
-    elif pct_change < -0.0005:
+    elif pct_change < -dead_band:
         direction = -1
     else:
         direction = 0
 
-    return ArimaResult(forecast, last_price, pct_change, direction, success=True)
+    return ArimaResult(
+        forecast=forecast,
+        forecast_lower=lower,
+        forecast_upper=upper,
+        last_price=last_price,
+        pct_change=pct_change,
+        direction=direction,
+        success=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -143,19 +166,24 @@ class MlResult:
     success: bool
 
 
-def _build_supervised(df: pd.DataFrame):
-    """Convierte el DataFrame enriquecido en (X, y) listos para entrenar."""
+def _build_supervised(df: pd.DataFrame, steps: int = 1):
+    """Convierte el DataFrame enriquecido en (X, y) listos para entrenar.
+
+    Para horizontes >1 bar predecimos el signo del retorno **acumulado**
+    en los próximos ``steps`` bars — más estable y útil que el bar a bar.
+    """
     work = df.copy()
-    # y_t = signo del retorno del siguiente bar
-    work["Target"] = (work["LogReturn"].shift(-1) > 0).astype(int)
+    future = work["Close"].pct_change(int(max(1, steps))).shift(-int(max(1, steps)))
+    work["Target"] = (future > 0).astype(int)
     work = work.dropna(subset=ML_FEATURES + ["Target"])
     X = work[ML_FEATURES]
     y = work["Target"]
     return X, y
 
 
-def ml_direction(df: pd.DataFrame) -> MlResult:
-    """Entrena un Gradient Boosting y predice la dirección del próximo bar.
+def ml_direction(df: pd.DataFrame, steps: int = 1) -> MlResult:
+    """Entrena un Gradient Boosting y predice la dirección del próximo
+    horizonte de ``steps`` bars.
 
     Se usa ``TimeSeriesSplit`` para no contaminar la validación con
     información del futuro.
@@ -163,7 +191,7 @@ def ml_direction(df: pd.DataFrame) -> MlResult:
     if df.empty or len(df) < 200:
         return MlResult(0.5, 0, 0.0, success=False)
 
-    X, y = _build_supervised(df)
+    X, y = _build_supervised(df, steps=steps)
     if len(X) < 150 or y.nunique() < 2:
         return MlResult(0.5, 0, 0.0, success=False)
 
